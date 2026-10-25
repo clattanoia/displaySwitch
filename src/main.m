@@ -1,4 +1,5 @@
 #import "DisplayCatalog.h"
+#import "SpaceTracker.h"
 #import <Cocoa/Cocoa.h>
 #import <ServiceManagement/ServiceManagement.h>
 
@@ -6,10 +7,13 @@ static NSString * const DSShowAllKey = @"showAllResolutions";
 static NSString * const DSShowMenuBarResolutionKey = @"showResolutionInMenuBar";
 static NSString * const DSFavoritesKey = @"favorites";
 static NSString * const DSDidWelcomeKey = @"didShowWelcome";
+static NSString * const DSSpaceResolutionsKey = @"spaceResolutions";
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) NSMenu *menu;
+@property (nonatomic) NSInteger spaceGeneration;
+@property (nonatomic) BOOL applyingSpaceResolution;
 - (void)refreshStatusItem;
 @end
 
@@ -42,6 +46,10 @@ static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     self.statusItem.menu = self.menu;
 
     CGDisplayRegisterReconfigurationCallback(DisplayReconfigured, NULL);
+    [[[NSWorkspace sharedWorkspace] notificationCenter] addObserver:self
+                                                           selector:@selector(spaceChanged:)
+                                                               name:NSWorkspaceActiveSpaceDidChangeNotification
+                                                             object:nil];
     [self refreshStatusItem];
     [self showWelcomeIfNeeded];
 }
@@ -198,6 +206,7 @@ static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
             rateItem.submenu = submenu;
             [menu addItem:rateItem];
         }
+        [self addSpaceItemsForDisplay:display toMenu:menu];
         [menu addItem:[NSMenuItem separatorItem]];
     }
 
@@ -227,8 +236,11 @@ static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
 
     NSMenuItem *hint = [[NSMenuItem alloc] initWithTitle:@"按住 Option 点击分辨率可加入常用" action:nil keyEquivalent:@""];
     hint.enabled = NO;
+    NSMenuItem *spaceHint = [[NSMenuItem alloc] initWithTitle:@"切到记住过的桌面时会自动换分辨率" action:nil keyEquivalent:@""];
+    spaceHint.enabled = NO;
     [optionsMenu addItem:[NSMenuItem separatorItem]];
     [optionsMenu addItem:hint];
+    [optionsMenu addItem:spaceHint];
     options.submenu = optionsMenu;
     [menu addItem:options];
 
@@ -288,6 +300,7 @@ static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
         [self presentFailure:error.localizedDescription ?: @"切换分辨率失败。"];
         return;
     }
+    [self updateSpaceBindingIfPresentForMode:mode];
     [self refreshStatusItem];
 }
 
@@ -349,6 +362,167 @@ static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
 - (void)quit:(id)sender {
     (void)sender;
     [NSApp terminate:nil];
+}
+
+#pragma mark - Spaces
+
+- (void)addSpaceItemsForDisplay:(DSDisplay *)display toMenu:(NSMenu *)menu {
+    if (![DSSpaceTracker isAvailable]) {
+        NSMenuItem *unavailable = [[NSMenuItem alloc] initWithTitle:@"无法识别桌面" action:nil keyEquivalent:@""];
+        unavailable.enabled = NO;
+        [menu addItem:unavailable];
+        return;
+    }
+
+    DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
+    if (!space) {
+        return;
+    }
+    if (space.type != 0) {
+        NSMenuItem *fullscreen = [[NSMenuItem alloc] initWithTitle:@"全屏空间不记录分辨率" action:nil keyEquivalent:@""];
+        fullscreen.enabled = NO;
+        [menu addItem:fullscreen];
+        return;
+    }
+
+    NSString *desktop = [NSString stringWithFormat:@"桌面 %ld", (long)space.number];
+    NSDictionary *saved = [self spaceResolutions][[self storageKeyForDisplay:display.key space:space.uuid]];
+    if (!saved) {
+        NSMenuItem *remember = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@记住当前分辨率", desktop]
+                                                            action:@selector(rememberCurrentSpace:)
+                                                     keyEquivalent:@""];
+        remember.target = self;
+        remember.representedObject = display.key;
+        [menu addItem:remember];
+        return;
+    }
+
+    DSMode *remembered = [self modeMatchingFavorite:saved inDisplay:display];
+    NSString *size = remembered ? [NSString stringWithFormat:@"%ld × %ld", (long)remembered.width, (long)remembered.height]
+                                : @"已记住的分辨率";
+    NSMenuItem *status = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@进入时使用 %@", desktop, size]
+                                                      action:nil
+                                               keyEquivalent:@""];
+    status.enabled = NO;
+    status.state = NSControlStateValueOn;
+    [menu addItem:status];
+
+    if (!remembered || ![remembered sameGeometryAs:display.current]) {
+        NSMenuItem *update = [[NSMenuItem alloc] initWithTitle:@"改为记住当前分辨率"
+                                                          action:@selector(rememberCurrentSpace:)
+                                                   keyEquivalent:@""];
+        update.target = self;
+        update.representedObject = display.key;
+        [menu addItem:update];
+    }
+
+    NSMenuItem *forget = [[NSMenuItem alloc] initWithTitle:@"取消此桌面的分辨率" action:@selector(forgetCurrentSpace:) keyEquivalent:@""];
+    forget.target = self;
+    forget.representedObject = display.key;
+    [menu addItem:forget];
+}
+
+- (void)spaceChanged:(NSNotification *)notification {
+    (void)notification;
+    if (self.applyingSpaceResolution) {
+        return;
+    }
+    self.spaceGeneration += 1;
+    NSInteger generation = self.spaceGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self.spaceGeneration || self.applyingSpaceResolution) {
+            return;
+        }
+        [self applyRememberedSpaceResolutions];
+    });
+}
+
+- (void)applyRememberedSpaceResolutions {
+    self.applyingSpaceResolution = YES;
+    for (DSDisplay *display in [DSCatalog activeDisplays]) {
+        DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
+        if (!space || space.type != 0) {
+            continue;
+        }
+        NSDictionary *saved = [self spaceResolutions][[self storageKeyForDisplay:display.key space:space.uuid]];
+        DSMode *mode = [self modeMatchingFavorite:saved inDisplay:display];
+        if (!mode || [mode sameGeometryAs:display.current]) {
+            continue;
+        }
+        [DSCatalog applyMode:mode error:NULL];
+    }
+    self.applyingSpaceResolution = NO;
+    [self refreshStatusItem];
+}
+
+- (void)rememberCurrentSpace:(NSMenuItem *)sender {
+    NSString *displayKey = sender.representedObject;
+    if (![displayKey isKindOfClass:NSString.class]) {
+        return;
+    }
+    for (DSDisplay *display in [DSCatalog activeDisplays]) {
+        if (![display.key isEqualToString:displayKey] || !display.current) {
+            continue;
+        }
+        DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
+        if (!space || space.type != 0) {
+            return;
+        }
+        [self setSpaceResolutionForDisplay:display.key space:space.uuid mode:display.current];
+        return;
+    }
+}
+
+- (void)forgetCurrentSpace:(NSMenuItem *)sender {
+    NSString *displayKey = sender.representedObject;
+    if (![displayKey isKindOfClass:NSString.class]) {
+        return;
+    }
+    for (DSDisplay *display in [DSCatalog activeDisplays]) {
+        if (![display.key isEqualToString:displayKey]) {
+            continue;
+        }
+        DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
+        if (!space) {
+            return;
+        }
+        NSMutableDictionary *all = [[self spaceResolutions] mutableCopy] ?: [NSMutableDictionary dictionary];
+        [all removeObjectForKey:[self storageKeyForDisplay:display.key space:space.uuid]];
+        [NSUserDefaults.standardUserDefaults setObject:all forKey:DSSpaceResolutionsKey];
+        return;
+    }
+}
+
+- (void)updateSpaceBindingIfPresentForMode:(DSMode *)mode {
+    DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:mode.displayID];
+    if (!space || space.type != 0) {
+        return;
+    }
+    NSString *key = [self storageKeyForDisplay:mode.displayKey space:space.uuid];
+    if (![self spaceResolutions][key]) {
+        return;
+    }
+    [self setSpaceResolutionForDisplay:mode.displayKey space:space.uuid mode:mode];
+}
+
+- (NSDictionary<NSString *, NSDictionary *> *)spaceResolutions {
+    NSDictionary *all = [NSUserDefaults.standardUserDefaults dictionaryForKey:DSSpaceResolutionsKey];
+    return [all isKindOfClass:NSDictionary.class] ? all : @{};
+}
+
+- (NSString *)storageKeyForDisplay:(NSString *)displayKey space:(NSString *)spaceUUID {
+    return [NSString stringWithFormat:@"%@|%@", displayKey, spaceUUID];
+}
+
+- (void)setSpaceResolutionForDisplay:(NSString *)displayKey space:(NSString *)spaceUUID mode:(DSMode *)mode {
+    NSMutableDictionary *all = [[self spaceResolutions] mutableCopy];
+    all[[self storageKeyForDisplay:displayKey space:spaceUUID]] = @{
+        @"w": @(mode.width),
+        @"h": @(mode.height),
+        @"pw": @(mode.pixelWidth),
+        @"ph": @(mode.pixelHeight),
+    };
+    [NSUserDefaults.standardUserDefaults setObject:all forKey:DSSpaceResolutionsKey];
 }
 
 - (void)presentFailure:(NSString *)message {
@@ -431,6 +605,19 @@ int main(int argc, const char *argv[]) {
         for (int index = 1; index < argc; index++) {
             if (strcmp(argv[index], "--list-modes") == 0) {
                 ListModes();
+                return 0;
+            }
+            if (strcmp(argv[index], "--list-spaces") == 0) {
+                printf("spaces available %d\n", [DSSpaceTracker isAvailable]);
+                for (DSDisplay *display in [DSCatalog activeDisplays]) {
+                    DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
+                    if (!space) {
+                        printf("%s -> none\n", display.name.UTF8String);
+                        continue;
+                    }
+                    printf("%s -> desktop %ld type %ld uuid %s\n", display.name.UTF8String, (long)space.number, (long)space.type,
+                           space.uuid.UTF8String);
+                }
                 return 0;
             }
         }

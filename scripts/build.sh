@@ -11,7 +11,7 @@ clang -fobjc-arc -O2 -Wall -Wextra -Wno-deprecated-declarations \
   -mmacosx-version-min=13.0 \
   -framework Cocoa -framework CoreGraphics -framework ServiceManagement \
   -o "$APP/Contents/MacOS/DisplaySwitch" \
-  "$ROOT/src/main.m" "$ROOT/src/DisplayCatalog.m"
+  "$ROOT/src/main.m" "$ROOT/src/DisplayCatalog.m" "$ROOT/src/SpaceTracker.m"
 
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP" >/dev/null
