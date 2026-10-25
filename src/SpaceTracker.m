@@ -53,6 +53,41 @@ typedef CFUUIDRef (*DSDisplayUUIDFunc)(CGDirectDisplayID);
     }
 }
 
++ (NSString *)nameForDesktopNumber:(NSInteger)number {
+    static NSString *format = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        format = [self desktopNameFormat];
+    });
+    return [NSString stringWithFormat:format, @(number)];
+}
+
++ (NSString *)desktopNameFormat {
+    NSString *root = @"/System/Library/CoreServices/Dock.app/Contents/Resources";
+    for (NSString *language in [NSLocale preferredLanguages]) {
+        NSMutableArray<NSString *> *candidates = [NSMutableArray arrayWithObjects:
+            [language stringByReplacingOccurrencesOfString:@"-" withString:@"_"],
+            language,
+            [language componentsSeparatedByString:@"-"].firstObject ?: language,
+            nil];
+        if ([language hasPrefix:@"zh-Hans"]) {
+            [candidates addObject:@"zh_CN"];
+        } else if ([language hasPrefix:@"zh-Hant"]) {
+            [candidates addObject:@"zh_TW"];
+            [candidates addObject:@"zh_HK"];
+        }
+        for (NSString *name in candidates) {
+            NSString *path = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.lproj/Localizable.strings", name]];
+            NSDictionary *table = [NSDictionary dictionaryWithContentsOfFile:path];
+            NSString *value = table[@"DesktopNum"];
+            if ([value isKindOfClass:NSString.class] && value.length > 0) {
+                return value;
+            }
+        }
+    }
+    return @"Desktop %@";
+}
+
 + (NSString *)uuidForDisplay:(CGDirectDisplayID)displayID {
     static DSDisplayUUIDFunc createUUID = NULL;
     static dispatch_once_t onceToken;
@@ -85,6 +120,7 @@ typedef CFUUIDRef (*DSDisplayUUIDFunc)(CGDirectDisplayID);
     }
     NSArray *displays = (__bridge_transfer NSArray *)raw;
     NSMutableArray<DSSpaceInfo *> *result = [NSMutableArray array];
+    NSInteger desktopNumber = 0;
     for (NSDictionary *displayInfo in displays) {
         if (![displayInfo isKindOfClass:NSDictionary.class]) {
             continue;
@@ -97,7 +133,6 @@ typedef CFUUIDRef (*DSDisplayUUIDFunc)(CGDirectDisplayID);
             continue;
         }
 
-        NSInteger desktopNumber = 0;
         for (NSDictionary *space in spaces) {
             if (![space isKindOfClass:NSDictionary.class]) {
                 continue;
@@ -115,6 +150,7 @@ typedef CFUUIDRef (*DSDisplayUUIDFunc)(CGDirectDisplayID);
             info.displayUUID = displayUUID;
             info.type = type;
             info.number = type == 0 ? desktopNumber : 0;
+            info.displayName = info.number > 0 ? [self nameForDesktopNumber:info.number] : @"";
             info.active = [uuid isEqualToString:currentUUID];
             [result addObject:info];
         }

@@ -385,7 +385,7 @@ static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
         return;
     }
 
-    NSString *desktop = [NSString stringWithFormat:@"桌面 %ld", (long)space.number];
+    NSString *desktop = space.displayName.length > 0 ? space.displayName : [NSString stringWithFormat:@"Desktop %ld", (long)space.number];
     NSDictionary *saved = [self spaceResolutions][[self storageKeyForDisplay:display.key space:space.uuid]];
     if (!saved) {
         NSMenuItem *remember = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@记住当前分辨率", desktop]
@@ -610,13 +610,16 @@ int main(int argc, const char *argv[]) {
             if (strcmp(argv[index], "--list-spaces") == 0) {
                 printf("spaces available %d\n", [DSSpaceTracker isAvailable]);
                 for (DSDisplay *display in [DSCatalog activeDisplays]) {
-                    DSSpaceInfo *space = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
-                    if (!space) {
-                        printf("%s -> none\n", display.name.UTF8String);
-                        continue;
+                    DSSpaceInfo *current = [DSSpaceTracker activeSpaceForDisplay:display.displayID];
+                    printf("%s current %s\n", display.name.UTF8String, current.displayName.UTF8String ?: "-");
+                }
+                NSString *previous = nil;
+                for (DSSpaceInfo *space in [DSSpaceTracker allSpaces]) {
+                    if (previous && ![previous isEqualToString:space.displayUUID]) {
+                        printf("\n");
                     }
-                    printf("%s -> desktop %ld type %ld uuid %s\n", display.name.UTF8String, (long)space.number, (long)space.type,
-                           space.uuid.UTF8String);
+                    previous = space.displayUUID;
+                    printf("  %s%s\n", space.displayName.UTF8String, space.active ? "  [current]" : "");
                 }
                 return 0;
             }
